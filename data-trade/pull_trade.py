@@ -344,6 +344,12 @@ def pull_endpoint(base: str, key: str, fields: list[str], port: str,
 
         header, data = rows[0], rows[1:]
         df = pd.DataFrame(data, columns=header)
+        # The Census API appends the variables you FILTER on (e.g. PORT, COMM_LVL)
+        # to the output columns. Since PORT is also in our `get` list, the response
+        # carries a duplicate PORT column; drop any such duplicate labels (keeping
+        # the first) so the frames have a unique column index -- otherwise a later
+        # pd.concat across imports/exports fails with InvalidIndexError.
+        df = df.loc[:, ~df.columns.duplicated()]
         df["time"] = tp
         frames.append(df)
         print(f"[data] {label} {tp} [{i}/{total}]: {len(df):,} rows.")
@@ -483,9 +489,18 @@ def main() -> int:
         vals = sorted(df["time"].dropna().unique())
         return (vals[0], vals[-1]) if vals else None
 
-    def distinct(df: pd.DataFrame, cols: list[str]) -> int:
-        col = next((c for c in cols if c in df.columns), None)
-        return int(df[col].nunique()) if col else 0
+    def distinct_union(dfs: list[pd.DataFrame], col: str) -> int:
+        """Count distinct non-null values of `col` across frames, without concat
+        (so it never trips over differing columns or duplicate labels)."""
+        vals: set = set()
+        for df in dfs:
+            if df.empty or col not in df.columns:
+                continue
+            s = df[col]
+            if isinstance(s, pd.DataFrame):  # guard against a stray duplicate label
+                s = s.iloc[:, 0]
+            vals |= set(s.dropna().unique())
+        return len(vals)
 
     imp_range = date_range(imports_df)
     exp_range = date_range(exports_df)
@@ -507,13 +522,9 @@ def main() -> int:
         "imports_date_range": imp_range,
         "exports_date_range": exp_range,
         "date_range": overall_range,
-        "distinct_hs_codes": int(pd.concat([
-            imports_df.get("I_COMMODITY", pd.Series(dtype=str)),
-            exports_df.get("E_COMMODITY", pd.Series(dtype=str)),
-        ]).nunique()),
-        "distinct_countries": distinct(pd.concat([imports_df, exports_df], ignore_index=True)
-                                       if not (imports_df.empty and exports_df.empty)
-                                       else pd.DataFrame(), ["CTY_CODE"]),
+        "distinct_hs_codes": distinct_union([imports_df], "I_COMMODITY")
+                             + distinct_union([exports_df], "E_COMMODITY"),
+        "distinct_countries": distinct_union([imports_df, exports_df], "CTY_CODE"),
         "imports_issues": imports_issues,
         "exports_issues": exports_issues,
         "files": sorted(p.name for p in RAW_CSV_DIR.glob("*.csv")),
