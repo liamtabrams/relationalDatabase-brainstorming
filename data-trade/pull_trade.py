@@ -390,6 +390,120 @@ def build_lookup(frames: list[pd.DataFrame], code_candidates: list[str],
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def load_existing_csv(path: Path) -> pd.DataFrame:
+    """Load a previously-saved data CSV, dropping any echoed-predicate duplicate
+    columns. pandas renames duplicate headers on read (PORT -> PORT.1), so we drop
+    any 'NAME.<n>' column whose base 'NAME' is also present."""
+    if not path.is_file():
+        return pd.DataFrame()
+    df = pd.read_csv(path, dtype=str, low_memory=False)
+    drop = [c for c in df.columns
+            if "." in c and c.rsplit(".", 1)[-1].isdigit()
+            and c.rsplit(".", 1)[0] in df.columns]
+    if drop:
+        print(f"[clean] {path.name}: dropped echoed duplicate column(s) {drop}")
+        df = df.drop(columns=drop)
+    return df
+
+
+def finalize(imports_df: pd.DataFrame, exports_df: pd.DataFrame,
+             imports_issues: list[dict], exports_issues: list[dict],
+             args: argparse.Namespace) -> int:
+    """Write the (cleaned) data CSVs, derived lookups, and the summary. Shared by
+    a normal pull and by --summary-only, so no network is required here."""
+    RAW_CSV_DIR.mkdir(parents=True, exist_ok=True)
+    imports_path = RAW_CSV_DIR / "imports_by_month_hs_country.csv"
+    exports_path = RAW_CSV_DIR / "exports_by_month_hs_country.csv"
+    if not imports_df.empty:
+        imports_df.to_csv(imports_path, index=False)
+    if not exports_df.empty:
+        exports_df.to_csv(exports_path, index=False)
+
+    commodities = build_lookup(
+        [imports_df, exports_df],
+        code_candidates=["I_COMMODITY", "E_COMMODITY"],
+        name_candidates=["I_COMMODITY_LDESC", "E_COMMODITY_LDESC",
+                         "I_COMMODITY_SDESC", "E_COMMODITY_SDESC"],
+    )
+    countries = build_lookup(
+        [imports_df, exports_df],
+        code_candidates=["CTY_CODE"],
+        name_candidates=["CTY_NAME"],
+    )
+    commodities.to_csv(RAW_CSV_DIR / "commodities.csv", index=False)
+    countries.to_csv(RAW_CSV_DIR / "countries.csv", index=False)
+
+    def date_range(df: pd.DataFrame) -> tuple[str, str] | None:
+        if df.empty or "time" not in df.columns:
+            return None
+        vals = sorted(df["time"].dropna().unique())
+        return (vals[0], vals[-1]) if vals else None
+
+    def distinct_union(dfs: list[pd.DataFrame], col: str) -> int:
+        """Count distinct non-null values of `col` across frames, without concat
+        (so it never trips over differing columns or duplicate labels)."""
+        vals: set = set()
+        for df in dfs:
+            if df.empty or col not in df.columns:
+                continue
+            s = df[col]
+            if isinstance(s, pd.DataFrame):  # guard against a stray duplicate label
+                s = s.iloc[:, 0]
+            vals |= set(s.dropna().unique())
+        return len(vals)
+
+    imp_range = date_range(imports_df)
+    exp_range = date_range(exports_df)
+    all_times = []
+    for df in (imports_df, exports_df):
+        if not df.empty and "time" in df.columns:
+            all_times += list(df["time"].dropna().unique())
+    overall_range = (min(all_times), max(all_times)) if all_times else None
+    requested_months = (args.end_year - args.start_year + 1) * 12
+
+    summary = {
+        "track": "trade",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "port": args.port,
+        "comm_level": args.comm_level,
+        "requested_months": requested_months,
+        "imports_rows": int(len(imports_df)),
+        "exports_rows": int(len(exports_df)),
+        "total_rows": int(len(imports_df) + len(exports_df)),
+        "imports_date_range": imp_range,
+        "exports_date_range": exp_range,
+        "date_range": overall_range,
+        "distinct_hs_codes": distinct_union([imports_df], "I_COMMODITY")
+                             + distinct_union([exports_df], "E_COMMODITY"),
+        "distinct_countries": distinct_union([imports_df, exports_df], "CTY_CODE"),
+        "imports_issues": imports_issues,
+        "exports_issues": exports_issues,
+        "files": sorted(p.name for p in RAW_CSV_DIR.glob("*.csv")),
+    }
+    (RAW_CSV_DIR / "_ingest_summary.json").write_text(json.dumps(summary, indent=2))
+
+    print("\n" + "=" * 70)
+    print("TRACK B SUMMARY")
+    print("=" * 70)
+    print(f"Imports rows        : {summary['imports_rows']:,}  -> {imports_path.name}")
+    print(f"Exports rows        : {summary['exports_rows']:,}  -> {exports_path.name}")
+    print(f"Total rows          : {summary['total_rows']:,}")
+    print(f"Date range (overall): {overall_range}")
+    print(f"Distinct HS codes   : {summary['distinct_hs_codes']:,}")
+    print(f"Distinct countries  : {summary['distinct_countries']:,}")
+    empties = [x['month'] for x in imports_issues + exports_issues if x['status'] == 'empty']
+    errors = [(x['month'], x['status']) for x in imports_issues + exports_issues if x['status'] != 'empty']
+    print(f"Empty months        : {len(empties)}"
+          + (f"  {empties}" if empties else ""))
+    print(f"Errored months      : {len(errors)}"
+          + (f"  {errors}" if errors else ""))
+    if imports_df.empty and exports_df.empty:
+        print("\n[!] No data present. Nothing fabricated -- see the issues above.")
+        return 2
+    print("\nDone.")
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     now = datetime.now()
     last_full_year = now.year - 1
@@ -402,6 +516,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--comm-level", default=DEFAULT_COMM_LVL, help="HS commodity level: HS2/HS4/HS6/HS10 (default HS4).")
     p.add_argument("--delay", type=float, default=DEFAULT_DELAY_S, help="Seconds between month requests (default 0.6).")
     p.add_argument("--dry-run", action="store_true", help="Print the plan and exit without any API calls.")
+    p.add_argument("--summary-only", action="store_true",
+                   help="Skip all API calls; rebuild lookups + summary from the CSVs "
+                        "already in raw_csv/ (also strips any duplicate columns).")
     return p.parse_args()
 
 
@@ -428,6 +545,17 @@ def main() -> int:
         print("[dry-run] At runtime, fields are intersected with each endpoint's "
               "variables.json before any data call.")
         return 0
+
+    # 0) Summary-only: rebuild from existing CSVs, no network, no key needed --
+    if args.summary_only:
+        print("\n[summary-only] Skipping all API calls; rebuilding from existing CSVs.")
+        imports_df = load_existing_csv(RAW_CSV_DIR / "imports_by_month_hs_country.csv")
+        exports_df = load_existing_csv(RAW_CSV_DIR / "exports_by_month_hs_country.csv")
+        if imports_df.empty and exports_df.empty:
+            print(f"[summary-only] No existing data CSVs found in {RAW_CSV_DIR}. "
+                  f"Run a normal pull first.")
+            return 2
+        return finalize(imports_df, exports_df, [], [], args)
 
     # 1) Key (fail loud) -----------------------------------------------------
     key = load_required_key("CENSUS_API_KEY")
@@ -460,97 +588,8 @@ def main() -> int:
     exports_df, exports_issues = pull_endpoint(
         EXPORTS_BASE, key, exp_fields, args.port, args.comm_level, months, args.delay, "exports")
 
-    # 5) Save ----------------------------------------------------------------
-    imports_path = RAW_CSV_DIR / "imports_by_month_hs_country.csv"
-    exports_path = RAW_CSV_DIR / "exports_by_month_hs_country.csv"
-    if not imports_df.empty:
-        imports_df.to_csv(imports_path, index=False)
-    if not exports_df.empty:
-        exports_df.to_csv(exports_path, index=False)
-
-    commodities = build_lookup(
-        [imports_df, exports_df],
-        code_candidates=["I_COMMODITY", "E_COMMODITY"],
-        name_candidates=["I_COMMODITY_LDESC", "E_COMMODITY_LDESC",
-                         "I_COMMODITY_SDESC", "E_COMMODITY_SDESC"],
-    )
-    countries = build_lookup(
-        [imports_df, exports_df],
-        code_candidates=["CTY_CODE"],
-        name_candidates=["CTY_NAME"],
-    )
-    commodities.to_csv(RAW_CSV_DIR / "commodities.csv", index=False)
-    countries.to_csv(RAW_CSV_DIR / "countries.csv", index=False)
-
-    # 6) Summary -------------------------------------------------------------
-    def date_range(df: pd.DataFrame) -> tuple[str, str] | None:
-        if df.empty or "time" not in df.columns:
-            return None
-        vals = sorted(df["time"].dropna().unique())
-        return (vals[0], vals[-1]) if vals else None
-
-    def distinct_union(dfs: list[pd.DataFrame], col: str) -> int:
-        """Count distinct non-null values of `col` across frames, without concat
-        (so it never trips over differing columns or duplicate labels)."""
-        vals: set = set()
-        for df in dfs:
-            if df.empty or col not in df.columns:
-                continue
-            s = df[col]
-            if isinstance(s, pd.DataFrame):  # guard against a stray duplicate label
-                s = s.iloc[:, 0]
-            vals |= set(s.dropna().unique())
-        return len(vals)
-
-    imp_range = date_range(imports_df)
-    exp_range = date_range(exports_df)
-    all_times = []
-    for df in (imports_df, exports_df):
-        if not df.empty and "time" in df.columns:
-            all_times += list(df["time"].dropna().unique())
-    overall_range = (min(all_times), max(all_times)) if all_times else None
-
-    summary = {
-        "track": "trade",
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "port": args.port,
-        "comm_level": args.comm_level,
-        "requested_months": len(months),
-        "imports_rows": int(len(imports_df)),
-        "exports_rows": int(len(exports_df)),
-        "total_rows": int(len(imports_df) + len(exports_df)),
-        "imports_date_range": imp_range,
-        "exports_date_range": exp_range,
-        "date_range": overall_range,
-        "distinct_hs_codes": distinct_union([imports_df], "I_COMMODITY")
-                             + distinct_union([exports_df], "E_COMMODITY"),
-        "distinct_countries": distinct_union([imports_df, exports_df], "CTY_CODE"),
-        "imports_issues": imports_issues,
-        "exports_issues": exports_issues,
-        "files": sorted(p.name for p in RAW_CSV_DIR.glob("*.csv")),
-    }
-    (RAW_CSV_DIR / "_ingest_summary.json").write_text(json.dumps(summary, indent=2))
-
-    print("\n" + "=" * 70)
-    print("TRACK B SUMMARY")
-    print("=" * 70)
-    print(f"Imports rows        : {summary['imports_rows']:,}  -> {imports_path.name}")
-    print(f"Exports rows        : {summary['exports_rows']:,}  -> {exports_path.name}")
-    print(f"Total rows          : {summary['total_rows']:,}")
-    print(f"Date range (overall): {overall_range}")
-    print(f"Distinct HS codes   : {summary['distinct_hs_codes']:,}")
-    print(f"Distinct countries  : {summary['distinct_countries']:,}")
-    empties = [x['month'] for x in imports_issues + exports_issues if x['status'] == 'empty']
-    errors = [(x['month'], x['status']) for x in imports_issues + exports_issues if x['status'] != 'empty']
-    print(f"Empty months        : {len(empties)}"
-          + (f"  {empties}" if empties else ""))
-    print(f"Errored months      : {len(errors)}"
-          + (f"  {errors}" if errors else ""))
-    if imports_df.empty and exports_df.empty:
-        print("\n[!] No data was retrieved. Nothing fabricated -- see the issues above.")
-        return 2
-    print("\nDone.")
-    return 0
+    # 5+6) Save lookups + write/print summary --------------------------------
+    return finalize(imports_df, exports_df, imports_issues, exports_issues, args)
 
 
 if __name__ == "__main__":

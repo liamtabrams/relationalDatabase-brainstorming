@@ -121,7 +121,10 @@ port-level by HS commodity (`porths`):
   countries, and any empty/errored months.
 
 Options: `--start-year`, `--end-year`, `--port`, `--comm-level` (HS2/HS4/HS6/
-HS10), `--delay`, `--dry-run`.
+HS10), `--delay`, `--dry-run`, and `--summary-only` (skip all API calls and
+rebuild the lookups + summary from the CSVs already in `raw_csv/`, also stripping
+any duplicate columns — useful if a run downloaded everything but you just want
+to regenerate the summary without re-pulling).
 
 ---
 
