@@ -1,0 +1,27 @@
+# --- Secrets / local settings ---
+# Local Claude Code settings hold API tokens (API_511_TOKEN, CENSUS_API_KEY).
+# NEVER commit this file.
+.claude/settings.local.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Downloaded / generated data ---
+# Raw CSV outputs and intermediate downloads can be large and are regenerable
+# from the ingestion scripts, so keep them out of version control.
+data-transit/raw_csv/*.csv
+data-trade/raw_csv/*.csv
+# Intermediate GTFS zip/txt downloads
+data-transit/_download/
+*.zip
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
